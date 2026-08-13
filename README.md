@@ -86,6 +86,49 @@ go build -o sam3-demo ./demo
 * `-threshold`: detection probability threshold (default `0.5`).
 * `-format`: output image format (`png`/`jpg`, default inferred from `-output`).
 
+## ROCm (AMD GPU)
+
+GoMLX's XLA auto-installer only ships CPU, CUDA, and TPU PJRT plugins, so AMD
+GPUs require installing the ROCm plugin manually.
+
+1. Install the ROCm PJRT plugin. Pick the wheel matching your ROCm version (the
+   example uses `rocm7.2.4`):
+
+   ```bash
+   curl -o /tmp/jax_rocm7_pjrt.whl \
+     "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/jax_rocm7_pjrt-0.8.2%2Brocm7.2.4-py3-none-manylinux_2_28_x86_64.whl"
+   unzip -o /tmp/jax_rocm7_pjrt.whl "jax_plugins/xla_rocm7/xla_rocm_plugin.so" -d /tmp/rocm_pjrt
+   mkdir -p ~/.local/lib/go-xla
+   mv /tmp/rocm_pjrt/jax_plugins/xla_rocm7/xla_rocm_plugin.so \
+     ~/.local/lib/go-xla/pjrt_c_api_rocm_plugin.so
+   ```
+
+   The plugin's `RUNPATH` points at `/opt/rocm/lib`, so it binds to the system
+   ROCm libraries with no extra `LD_LIBRARY_PATH`.
+
+2. Run with the `rocm` backend:
+
+   ```bash
+   export GOMLX_BACKEND=xla:rocm
+   export XLA_FLAGS="--xla_gpu_graph_min_graph_size=999999"
+   ```
+
+   `compute.New()` only auto-selects the `cuda`/`cpu` plugins, so
+   `GOMLX_BACKEND` is required. The `XLA_FLAGS` setting works around a HIP-graph
+   assertion (`hip::GraphNode::SetStream`) seen with some ROCm builds; without
+   it the backend may abort during execution.
+
+3. Compilation vs. inference trade-off. The XLA ROCm plugin takes ~45s to
+   compile the SAM 3.1 graph (vs. ~9s for CPU), so a single one-off `sam3-demo`
+   run finishes faster on CPU. Once compiled, ROCm inference is ~22× faster
+   (~0.7s vs. ~16s per image on `classify/boats.png`), which makes ROCm the
+   better choice for batch or service workloads:
+
+   ```bash
+   GOMLX_BACKEND=xla:rocm XLA_FLAGS="--xla_gpu_graph_min_graph_size=999999" \
+     go test -run '^$' -bench BenchmarkSegment -benchtime=5x -benchmem
+   ```
+
 ## Notes
 
 * All weights are cast to float32 at load time for simplicity; bf16 inference
@@ -113,12 +156,6 @@ python3 test/generate_test_data.py \
 
 # Run the parity test:
 go test -run TestSAM3Parity -v
-```
-
-On this host (ROCm) torchvision must be the ROCm build matching torch:
-
-```bash
-pip install torchvision==0.28.0+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2
 ```
 
 The reference model is run in **fp32** (no autocast, fused bf16 MLP replaced)

@@ -18,16 +18,16 @@ package sam3
 import (
 	"fmt"
 	"image"
-	"image/color"
+	"image/draw"
 	"math"
 	"sort"
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
+	"github.com/gomlx/compute/shapes"
 	modelimage "github.com/gomlx/go-huggingface/models/image"
 	. "github.com/gomlx/gomlx/core/graph"
 	"github.com/gomlx/gomlx/core/tensors"
-	"github.com/gomlx/gomlx/core/tensors/images"
 	"github.com/gomlx/gomlx/ml/model"
 )
 
@@ -265,7 +265,7 @@ func (p *Segmenter) Segment(img image.Image, options *SegmentationOptions) ([]De
 	points, pointLabels, pointMask := p.buildPoints(options.Points, origW, origH)
 	boxes, boxLabels, boxMask := p.buildBoxes(options.Boxes, origW, origH)
 
-	imgTensor := images.ToTensor(dtypes.Float32).Single(img)
+	imgTensor := imageToTensor(img)
 	tokenTensor := tensors.FromValue([][]int32{ids32})
 	pointsTensor := tensors.FromValue(points)
 	pointLabelsTensor := tensors.FromValue(pointLabels)
@@ -300,6 +300,9 @@ func (p *Segmenter) Segment(img image.Image, options *SegmentationOptions) ([]De
 	nq := len(logitsVal[0])
 	presenceProb := sigmoid(presenceVal[0][0])
 
+	// Precompute the bilinear sampling grid once; it is shared by all detections.
+	resizer := newMaskResizer(len(masksVal[0][0]), len(masksVal[0][0][0]), origW, origH)
+
 	var detections []Detection
 	for q := 0; q < nq; q++ {
 		prob := sigmoid(logitsVal[0][q][0]) * presenceProb
@@ -308,7 +311,7 @@ func (p *Segmenter) Segment(img image.Image, options *SegmentationOptions) ([]De
 		}
 		b := boxesVal[0][q] // cxcywh normalized
 		box := denormalizeBox(b, origW, origH)
-		mask := resizeMaskBilinear(masksVal[0][q], origW, origH, 0.5)
+		mask := resizer.resize(masksVal[0][q], 0.5)
 		detections = append(detections, Detection{Mask: mask, Box: box, Score: prob})
 	}
 
@@ -388,41 +391,109 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
-// resizeMaskBilinear resizes a mask-logit grid to the target size using
-// bilinear interpolation, applies sigmoid, and thresholds into a binary image.
-func resizeMaskBilinear(logits [][]float32, targetW, targetH int, threshold float32) image.Image {
-	srcH := len(logits)
-	srcW := len(logits[0])
-	img := image.NewGray(image.Rect(0, 0, targetW, targetH))
+// maskResizer resizes detection mask logits to the original image resolution
+// using bilinear interpolation. The sampling grid depends only on the source
+// and target sizes, so it is precomputed once and reused across all detections.
+type maskResizer struct {
+	x0, x1 []int     // per-target-x horizontal sample indices.
+	wx     []float64 // per-target-x horizontal weights.
+	y0, y1 []int     // per-target-y vertical sample indices.
+	wy     []float64 // per-target-y vertical weights.
+}
 
+// newMaskResizer precomputes the bilinear sampling grid. srcH/srcW is the mask
+// logit grid size (e.g. 288x288); targetW/targetH is the original image size.
+func newMaskResizer(srcH, srcW, targetW, targetH int) *maskResizer {
+	r := &maskResizer{
+		x0: make([]int, targetW), x1: make([]int, targetW), wx: make([]float64, targetW),
+		y0: make([]int, targetH), y1: make([]int, targetH), wy: make([]float64, targetH),
+	}
+	for x := range targetW {
+		srcX := (float64(x)+0.5)*float64(srcW)/float64(targetW) - 0.5
+		x0 := int(math.Floor(srcX))
+		r.x0[x] = clampInt(x0, 0, srcW-1)
+		r.x1[x] = clampInt(x0+1, 0, srcW-1)
+		r.wx[x] = srcX - float64(x0)
+	}
 	for y := range targetH {
 		srcY := (float64(y)+0.5)*float64(srcH)/float64(targetH) - 0.5
 		y0 := int(math.Floor(srcY))
-		y1 := y0 + 1
-		wy := srcY - float64(y0)
+		r.y0[y] = clampInt(y0, 0, srcH-1)
+		r.y1[y] = clampInt(y0+1, 0, srcH-1)
+		r.wy[y] = srcY - float64(y0)
+	}
+	return r
+}
+
+// resize bilinearly interpolates one mask logit grid and thresholds it into a
+// binary image. The sigmoid is monotonic, so the logits are thresholded
+// directly against logit(threshold) (which is 0 for the default threshold of
+// 0.5) instead of evaluating the sigmoid on every pixel.
+func (r *maskResizer) resize(logits [][]float32, threshold float32) *image.Gray {
+	targetW, targetH := len(r.wx), len(r.wy)
+	img := image.NewGray(image.Rect(0, 0, targetW, targetH))
+	pix, stride := img.Pix, img.Stride
+
+	logitThreshold := float64(0)
+	if threshold != 0.5 {
+		logitThreshold = math.Log(float64(threshold) / float64(1-threshold))
+	}
+
+	for y := range targetH {
+		row0 := logits[r.y0[y]]
+		row1 := logits[r.y1[y]]
+		wy, ony := r.wy[y], 1-r.wy[y]
+		dst := pix[y*stride : y*stride+targetW]
 		for x := range targetW {
-			srcX := (float64(x)+0.5)*float64(srcW)/float64(targetW) - 0.5
-			x0 := int(math.Floor(srcX))
-			x1 := x0 + 1
-			wx := srcX - float64(x0)
-
-			cy0 := clampInt(y0, 0, srcH-1)
-			cy1 := clampInt(y1, 0, srcH-1)
-			cx0 := clampInt(x0, 0, srcW-1)
-			cx1 := clampInt(x1, 0, srcW-1)
-
-			v := float64(logits[cy0][cx0])*(1-wy)*(1-wx) +
-				float64(logits[cy0][cx1])*(1-wy)*wx +
-				float64(logits[cy1][cx0])*wy*(1-wx) +
-				float64(logits[cy1][cx1])*wy*wx
-
-			p := sigmoid(float32(v))
-			val := byte(0)
-			if p > threshold {
-				val = 255
+			x0, x1, wx := r.x0[x], r.x1[x], r.wx[x]
+			v := float64(row0[x0])*ony*(1-wx) +
+				float64(row0[x1])*ony*wx +
+				float64(row1[x0])*wy*(1-wx) +
+				float64(row1[x1])*wy*wx
+			if v > logitThreshold {
+				dst[x] = 255
 			}
-			img.SetGray(x, y, color.Gray{Y: val})
 		}
 	}
 	return img
+}
+
+// imageToTensor converts img to a [height, width, 3] float32 tensor with pixel
+// values scaled to [0, 1]. It reads the raw pixel bytes directly (avoiding the
+// per-pixel interface boxing of image.Image.At) to keep allocations minimal.
+func imageToTensor(img image.Image) *tensors.Tensor {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	t := tensors.FromShape(shapes.Make(dtypes.Float32, h, w, 3))
+	t.MustMutableFlatData(func(flatAny any) {
+		data := flatAny.([]float32)
+		switch src := img.(type) {
+		case *image.RGBA:
+			fillRGBPix(data, w, h, src.Pix, src.Stride, src.PixOffset(b.Min.X, b.Min.Y), 4)
+		case *image.NRGBA:
+			fillRGBPix(data, w, h, src.Pix, src.Stride, src.PixOffset(b.Min.X, b.Min.Y), 4)
+		default:
+			// Normalize to RGBA with a single bulk draw, then read the bytes.
+			rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+			draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)
+			fillRGBPix(data, w, h, rgba.Pix, rgba.Stride, 0, 4)
+		}
+	})
+	return t
+}
+
+// fillRGBPix fills data (h*w*3) with the RGB channels of an 8-bit pixel buffer,
+// scaling each channel to [0, 1].
+func fillRGBPix(data []float32, w, h int, pix []byte, stride, offset, bytesPerPixel int) {
+	p := 0
+	for y := range h {
+		row := pix[y*stride+offset:]
+		for x := range w {
+			i := x * bytesPerPixel
+			data[p] = float32(float64(row[i]) / 255.0)
+			data[p+1] = float32(float64(row[i+1]) / 255.0)
+			data[p+2] = float32(float64(row[i+2]) / 255.0)
+			p += 3
+		}
+	}
 }
