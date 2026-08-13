@@ -129,6 +129,24 @@ GPUs require installing the ROCm plugin manually.
      go test -run '^$' -bench BenchmarkSegment -benchtime=5x -benchmem
    ```
 
+### PyTorch comparison (RX 7900 XTX, ROCm 7.2, SAM 3.1 @ 1008×1008, text prompt)
+
+On the same task (segment `classify/boats.png` with the text prompt "boats"),
+GoMLX's compiled XLA kernels are faster than PyTorch eager, but the host-side
+mask post-processing and the one-time compile narrow the end-to-end gap:
+
+| | GoMLX (`xla:rocm`) | PyTorch (ROCm) |
+|---|---|---|
+| one-time setup (load + compile/warmup) | ~49 s (47 s XLA compile) | ~7 s |
+| steady-state model forward | ~390 ms | ~481 ms |
+| steady-state end-to-end `Segment` | ~730 ms | ~481 ms (forward only) |
+
+GoMLX's forward is ~19% faster, but `Segment` spends ~340 ms on the CPU
+bilinearly upsampling the 122 detected masks to the original resolution — a
+host-side cost PyTorch doesn't pay in this comparison. Moving that upsampling
+into the graph would put GoMLX ahead end-to-end. PyTorch also starts ~7× faster
+because it has no XLA compilation step.
+
 ## Notes
 
 * All weights are cast to float32 at load time for simplicity; bf16 inference
