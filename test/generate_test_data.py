@@ -24,6 +24,16 @@ import torch
 # Import the reference model (assumes the sam3 Python package is on sys.path).
 from sam3.model.data_misc import FindStage  # noqa: E402
 from sam3.model_builder import build_sam3_image_model  # noqa: E402
+import sam3.model.vitdet as vitdet  # noqa: E402
+
+
+def _addmm_act_fp32(act_cls, linear, mat1):
+    # The reference Mlp uses a fused bf16 addmm_act; replace it with a plain
+    # fp32 linear+activation so the reference runs in fp32, matching GoMLX.
+    return act_cls()(linear(mat1))
+
+
+vitdet.addmm_act = _addmm_act_fp32
 
 
 def preprocess_image(path, resolution=1008, device="cuda"):
@@ -41,10 +51,16 @@ def load_weights(model, safetensors_path):
     from safetensors.torch import load_file
 
     ckpt = load_file(safetensors_path, device="cpu")
-    # Cast mixed bf16/f32 to f32 and strip the "detector." prefix (the reference
-    # image model exposes weights without it).
-    state_dict = {k: v.float() for k, v in ckpt.items() if k.startswith("detector.")}
-    state_dict = {k[len("detector."):]: v for k, v in state_dict.items()}
+    # Strip the "detector." prefix (the reference image model exposes weights
+    # without it) and cast real weights to f32. Complex buffers (the ViT RoPE
+    # freqs_cis) must NOT be cast with .float(), which would silently discard
+    # the imaginary (sin) part and corrupt the rotary encoding.
+    state_dict = {}
+    for k, v in ckpt.items():
+        if not k.startswith("detector."):
+            continue
+        k = k[len("detector."):]
+        state_dict[k] = v if v.is_complex() else v.float()
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"missing keys ({len(missing)}): {missing[:5]}...")
@@ -80,31 +96,30 @@ def main():
     image, _ = preprocess_image(args.image, resolution=1008, device=device)
 
     state = {}
-    # The reference model uses bf16 fused ops (addmm_act); run under autocast,
-    # matching Sam3BasePredictor.add_prompt.
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        state["backbone_out"] = model.backbone.forward_image(image)
-        text_outputs = model.backbone.forward_text([args.text], device=device)
-        state["backbone_out"].update(text_outputs)
+    # Run the reference in fp32 (no autocast, fused MLP replaced with fp32) to
+    # match the GoMLX implementation, which is fp32 throughout.
+    state["backbone_out"] = model.backbone.forward_image(image)
+    text_outputs = model.backbone.forward_text([args.text], device=device)
+    state["backbone_out"].update(text_outputs)
 
-        find_stage = FindStage(
-            img_ids=torch.tensor([0], device=device, dtype=torch.long),
-            text_ids=torch.tensor([0], device=device, dtype=torch.long),
-            input_boxes=None,
-            input_boxes_mask=None,
-            input_boxes_label=None,
-            input_points=None,
-            input_points_mask=None,
-        )
-        geometric_prompt = model._get_dummy_prompt()
+    find_stage = FindStage(
+        img_ids=torch.tensor([0], device=device, dtype=torch.long),
+        text_ids=torch.tensor([0], device=device, dtype=torch.long),
+        input_boxes=None,
+        input_boxes_mask=None,
+        input_boxes_label=None,
+        input_points=None,
+        input_points_mask=None,
+    )
+    geometric_prompt = model._get_dummy_prompt()
 
-        print("Running forward...")
-        outputs = model.forward_grounding(
-            backbone_out=state["backbone_out"],
-            find_input=find_stage,
-            geometric_prompt=geometric_prompt,
-            find_target=None,
-        )
+    print("Running forward...")
+    outputs = model.forward_grounding(
+        backbone_out=state["backbone_out"],
+        find_input=find_stage,
+        geometric_prompt=geometric_prompt,
+        find_target=None,
+    )
 
     backbone_out = state["backbone_out"]
 

@@ -121,10 +121,10 @@ On this host (ROCm) torchvision must be the ROCm build matching torch:
 pip install torchvision==0.28.0+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2
 ```
 
-The reference model runs in bfloat16 (its fused MLP casts to bf16) while this
-implementation runs in float32. Structural quantities (backbone FPN, position
-encodings, text features, encoder memory, decoder queries, boxes) agree to
-bf16/fp32 precision; the detection-score heads (dot-product scoring, presence
-head, mask logits) amplify a small residual ViT-attention discrepancy
-(~1e-2 per block, still under investigation) into the final logits, so those
-are checked with a relaxed tolerance.
+The reference model is run in **fp32** (no autocast, fused bf16 MLP replaced)
+and its complex RoPE buffers are preserved, so it matches this float32
+implementation directly. Structural quantities (backbone FPN, position
+encodings, text features, encoder memory, decoder queries) agree to ~1e-5; the
+detection-score heads (dot-product scoring, presence head, mask logits, box
+regression) amplify the accumulated rounding and are checked with a slightly
+relaxed tolerance.

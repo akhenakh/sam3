@@ -38,9 +38,9 @@ type parityExpected struct {
 }
 
 // TestSAM3Parity compares the GoMLX implementation against reference values
-// produced by the PyTorch model. The reference runs in bfloat16 (the model's
-// fused MLP casts to bf16), while this implementation runs in float32, so the
-// tolerances below are set for bf16-level agreement. They are tight enough to
+// produced by the PyTorch model. Both run in float32 (the reference is run
+// without autocast and with its fused bf16 MLP replaced by plain fp32 ops), so
+// the tolerances below are set for fp32-level agreement and are tight enough to
 // catch architecture, weight-mapping, and shape errors.
 func TestSAM3Parity(t *testing.T) {
 	if testing.Short() {
@@ -163,26 +163,23 @@ func TestSAM3Parity(t *testing.T) {
 		t.Logf("vision_pos_enc[%d]: exp=%g got=%g", i, expected.VisionPosEncMeans[i], gotPosEncMeans[i])
 	}
 
-	// bf16-level agreement.
+	// fp32-level agreement.
 	//
-	// The reference model runs in bfloat16 (its fused MLP casts to bf16), while
-	// this implementation runs in float32. Structural quantities (backbone FPN,
-	// position encodings, text features, encoder memory, decoder queries, boxes)
-	// agree to bf16 precision. The detection-score heads (dot-product scoring,
-	// presence head, mask logits) amplify the accumulated error, so they are
-	// checked with a relaxed tolerance. There is a known residual discrepancy in
-	// the ViT attention (~1e-2 per block) that grows through the 32-block
-	// backbone and dominates the final logits; it is still under investigation.
-	require.InDelta(t, expected.PredMasksMean, gotPredMasksMean, 1.5, "pred_masks mean")
-	require.InDelta(t, expected.PredBoxesMean, gotPredBoxesMean, 0.05, "pred_boxes mean")
-	require.InDelta(t, expected.EncoderHiddenStatesMean, gotEncMean, 0.1, "encoder memory mean")
-	require.InDelta(t, expected.QueriesMean, gotQueriesMean, 0.05, "queries mean")
-	require.InDelta(t, expected.LanguageFeaturesMean, gotTextMean, 0.1, "text features mean")
+	// Both implementations run in float32. Structural quantities (backbone FPN,
+	// position encodings, text features, encoder memory, decoder queries) agree
+	// to ~1e-5. The detection-score heads (dot-product scoring, presence head,
+	// mask logits, box regression) amplify the accumulated rounding, so they are
+	// checked with slightly relaxed tolerances.
+	require.InDelta(t, expected.PredMasksMean, gotPredMasksMean, 1e-3, "pred_masks mean")
+	require.InDelta(t, expected.PredBoxesMean, gotPredBoxesMean, 1e-2, "pred_boxes mean")
+	require.InDelta(t, expected.EncoderHiddenStatesMean, gotEncMean, 1e-5, "encoder memory mean")
+	require.InDelta(t, expected.QueriesMean, gotQueriesMean, 1e-5, "queries mean")
+	require.InDelta(t, expected.LanguageFeaturesMean, gotTextMean, 1e-5, "text features mean")
 	for i := range 3 {
-		require.InDelta(t, expected.BackboneFPNMeans[i], gotFPNMeans[i], 0.05, "backbone_fpn[%d] mean", i)
-		require.InDelta(t, expected.VisionPosEncMeans[i], gotPosEncMeans[i], 0.05, "vision_pos_enc[%d] mean", i)
+		require.InDelta(t, expected.BackboneFPNMeans[i], gotFPNMeans[i], 1e-5, "backbone_fpn[%d] mean", i)
+		require.InDelta(t, expected.VisionPosEncMeans[i], gotPosEncMeans[i], 1e-4, "vision_pos_enc[%d] mean", i)
 	}
-	require.InDelta(t, expected.PresenceLogit[0], float64(gotPresence[0]), 0.6, "presence_logit")
+	require.InDelta(t, expected.PresenceLogit[0], float64(gotPresence[0]), 1e-3, "presence_logit")
 
 	// The detection logits are compared by mean (robust to error amplification).
 	gotLogitsMean := float64(0)
@@ -195,7 +192,7 @@ func TestSAM3Parity(t *testing.T) {
 		expLogitsMean += v
 	}
 	expLogitsMean /= float64(len(expected.PredLogits))
-	require.InDelta(t, expLogitsMean, gotLogitsMean, 1.5, "pred_logits mean")
+	require.InDelta(t, expLogitsMean, gotLogitsMean, 1e-3, "pred_logits mean")
 }
 
 func buildTestPoints(n int) ([][][]float32, [][]int32, [][]bool) {

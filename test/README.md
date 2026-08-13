@@ -9,7 +9,7 @@ pick up where the previous investigation left off.
 
 | File | Purpose |
 |---|---|
-| `generate_test_data.py` | Builds the reference `build_sam3_image_model`, loads the bf16 safetensors checkpoint, runs a **text-only** prompt (`"buildings"`) on `test_image.png`, and dumps tensor statistics to `sam3_test_data.json`. |
+| `generate_test_data.py` | Builds the reference `build_sam3_image_model`, loads the bf16 safetensors checkpoint (preserving the complex RoPE buffers), runs a **text-only** prompt (`"buildings"`) on `test_image.png` in fp32, and dumps tensor statistics to `sam3_test_data.json`. |
 | `sam3_test_data.json` | The reference values (token ids, backbone/text/encoder/queries means, `pred_logits`, `pred_boxes` mean, `pred_masks` mean, `presence_logit`). |
 | `test_image.png` | Deterministic 1008×1008 synthetic image (gradient + a few colored rectangles). Sized at exactly the model resolution so resize is a no-op and preprocessing is bit-reproducible. |
 | `bpe_simple_vocab_16e6.txt.gz` | CLIP BPE vocabulary (copied from the reference `sam3` package). |
@@ -45,13 +45,11 @@ go test -run TestSAM3Parity -v
 
 ## What was verified (and how)
 
-The investigation bisected the model from the outputs backward. Two reference
-configurations were used:
-
-- **bf16**: the model as it actually runs (`torch.autocast(bfloat16)`).
-- **fp32**: the same model with `sam3.model.vitdet.addmm_act` monkeypatched to
-  run `F.linear` + `F.gelu` in fp32 instead of the fused bf16 op. This isolates
-  real bugs from bf16-vs-fp32 quantization noise.
+The investigation bisected the model from the outputs backward. The reference
+is run in **fp32**: weights are cast to fp32, `sam3.model.vitdet.addmm_act` is
+monkeypatched to run `F.linear` + `F.gelu` in fp32 (instead of the fused bf16
+op), and there is no autocast. This matches the GoMLX implementation, which is
+fp32 throughout, and isolates real bugs from bf16-vs-fp32 quantization noise.
 
 Confirmed **exact** (fp32, matches to ~1e-6):
 
@@ -71,33 +69,31 @@ Confirmed **exact** (fp32, matches to ~1e-6):
    implementation emitted `[x, y, w, h]`. Fixed in `transformer.go`
    (`genSineEmbed` now uses order `[1, 0, 2, 3]` for cxcywh input).
 
-## Known residual difference (open)
+2. **Reference-data RoPE corruption (the root cause of the residual gap).** The
+   safetensors checkpoint stores the ViT rotary-encoding buffers as
+   **complex64** `freqs_cis` tensors (real = cos, imag = sin). The reference
+   weight loader cast every value with `.float()`, which silently discards the
+   imaginary part of a complex tensor — so the reference model ran with a
+   cos-only rotation (no sin), while GoMLX computes cos/sin correctly from
+   scratch. This single corruption produced the ~2e-3-per-element ViT attention
+   difference and the ~1.25 shift in `pred_logits` mean.
 
-There is still a small numerical discrepancy in the **ViT attention**: the
-block-0 attention output differs from the fp32 reference by ~2e-3 per element,
-which grows through the 32-block backbone (and the encoder/decoder) into a
-~1.25 shift in the mean of the final `pred_logits`.
+   Fixed in `generate_test_data.py`'s `load_weights`: complex tensors are kept
+   as-is, only real tensors are cast to fp32. After the fix, block-0 attention
+   intermediates (qkv, post-RoPE q/k, softmax coefficients, proj output) agree
+   with GoMLX to ~1e-7, and every output statistic agrees to ~1e-5 (see below).
 
-What has been **ruled out**:
+## Resolution status
 
-- RoPE frequencies (exact match with checkpoint buffers).
-- Position encodings, `query_pos`, `boxRPB` (exact match).
-- The fused vs decomposed attention path (`DisableFusion` changes nothing).
-- bf16-vs-fp32 (the fp32-vs-fp32 comparison still diverges).
-- The MLP/GELU (the ViT block-0 MLP error is downstream of the attention error,
-  not its source).
+With the RoPE corruption fixed and the reference run in fp32, `TestSAM3Parity`
+passes at fp32-level tolerances:
 
-What is left to check (handoff pointers): dump the q/k/v **after** the RoPE
-rotation, and the softmax coefficients, for a single window and compare against
-PyTorch's `scaled_dot_product_attention` step-by-step. The likely culprits are a
-subtle difference in the RoPE application, the attention softmax, or the
-score scaling, all of which live in `backbone.go` (`vitAttention`,
-`applyRoPE`, `axialCis`).
+- backbone FPN / position encodings / text / encoder / queries: ~1e-5 … ~1e-7.
+- `pred_logits` max element diff: ~4e-4 (mean diff is far smaller).
+- `pred_masks` mean: ~3e-5; `presence_logit`: ~2e-5.
+- `pred_boxes` mean: ~5e-3 (the largest residual; it is fp32 accumulation
+  through the 6-layer box refinement sigmoid/inverse-sigmoid, not a bug — the
+  `inverse_sigmoid` implementation was verified to match the reference).
 
-**Practical impact**: the user confirmed the model produces correct, legitimate
-segmentations on real satellite imagery (buildings), so the discrepancy is a
-numerical-precision matter that does not change the model's behavior on real
-inputs. The parity test therefore keeps **strict** tolerances on the structural
-quantities (backbone FPN, position encodings, text/encoder/queries/boxes) and a
-**relaxed** tolerance on the score heads, and documents the residual in its
-comments.
+The GoMLX implementation is now numerically correct against the fp32 reference;
+no residual discrepancy remains open.
