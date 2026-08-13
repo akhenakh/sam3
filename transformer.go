@@ -196,7 +196,9 @@ func crossAttnMaskWithPresence(mask *Node) *Node {
 	return Concatenate([]*Node{zeroRow, mask}, 2)
 }
 
-// genSineEmbed generates the sine embedding for a [.., n] coordinate tensor.
+// genSineEmbed generates the sine embedding for a [.., n] coordinate tensor,
+// matching gen_sineembed_for_position: coordinates are emitted in the order
+// [y, x, w, h] for 4-dim cxcywh input and [y, x] for 2-dim xy input.
 func genSineEmbed(g *Graph, pos *Node, numFeats int) *Node {
 	half := numFeats / 2
 	scale := 2 * math.Pi
@@ -205,8 +207,19 @@ func genSineEmbed(g *Graph, pos *Node, numFeats int) *Node {
 	dimT = Reshape(dimT, 1, 1, half)
 
 	n := pos.Shape().Dim(-1)
+	order := make([]int, n)
+	switch n {
+	case 2:
+		order = []int{1, 0}
+	case 4:
+		order = []int{1, 0, 2, 3}
+	default:
+		for i := range n {
+			order[i] = i
+		}
+	}
 	embeds := make([]*Node, 0, n)
-	for i := range n {
+	for _, i := range order {
 		coord := Slice(pos, AxisRange().Spacer(), AxisRange(i, i+1))
 		coord = Div(MulScalar(coord, scale), dimT)
 		embeds = append(embeds, interleaveSinCos(coord))

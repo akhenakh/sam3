@@ -86,3 +86,37 @@ go build -o sam3-demo ./models/sam3/demo
 * All weights are cast to float32 at load time for simplicity; bf16 inference
   is left as a future optimization.
 * The tracker / Object Multiplex video stack is intentionally out of scope.
+
+## Parity testing
+
+A parity harness compares the GoMLX implementation against reference values
+produced by the PyTorch model:
+
+* `test/generate_test_data.py` — builds the reference `build_sam3_image_model`,
+  loads the bf16 safetensors checkpoint, runs a text-only prompt on
+  `test/test_image.png`, and dumps intermediate/final tensor statistics to
+  `test/sam3_test_data.json`.
+* `test/sam3_test_data.json` — the generated reference values.
+* `parity_test.go` — `TestSAM3Parity` loads the GoMLX model, runs the same
+  forward pass, and asserts agreement.
+
+```bash
+# Regenerate the reference values (requires torch + ROCm torchvision):
+python3 test/generate_test_data.py \
+    --safetensors /path/to/sam3.1_multiplex_bf16.safetensors \
+    --bpe /path/to/bpe_simple_vocab_16e6.txt.gz
+
+# Run the parity test:
+go test -run TestSAM3Parity -v
+```
+
+On this host (ROCm) torchvision must be the ROCm build matching torch:
+
+```bash
+pip install torchvision==0.28.0+rocm7.2 --index-url https://download.pytorch.org/whl/rocm7.2
+```
+
+The reference model runs in bfloat16 (its fused MLP casts to bf16) while this
+implementation runs in float32, so the backbone/encoder/decoder statistics
+agree to bf16 precision, and the final detection score heads (which amplify
+small query differences) are checked with a relaxed tolerance.

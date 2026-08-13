@@ -31,7 +31,9 @@ import (
 	"github.com/gomlx/gomlx/ml/model"
 )
 
-// ForwardOutput holds the outputs of the SAM 3.1 image grounding model.
+// ForwardOutput holds the outputs of the SAM 3.1 image grounding model. The
+// intermediate fields are exposed primarily for testing/parity and can be
+// ignored for normal inference.
 type ForwardOutput struct {
 	// PredLogits are the raw detection scores [batch, numQueries, 1].
 	PredLogits *Node
@@ -41,6 +43,24 @@ type ForwardOutput struct {
 	PredMasks *Node
 	// PresenceLogit is the presence-token logit [batch, 1].
 	PresenceLogit *Node
+
+	// FPNFeatures are the ViTDet neck features (high-to-low resolution), each
+	// [batch, 256, H, W].
+	FPNFeatures []*Node
+	// FPNPosEnc are the positional encodings for each FPN level.
+	FPNPosEnc []*Node
+	// TextMemory is the text-encoder output [contextLength, batch, 256].
+	TextMemory *Node
+	// GeoFeats is the geometry-encoder output [seq, batch, 256].
+	GeoFeats *Node
+	// Prompt is the concatenated text+geometry prompt [seqTotal, batch, 256].
+	Prompt *Node
+	// EncoderMemory is the transformer-encoder output [H*W, batch, 256].
+	EncoderMemory *Node
+	// EncoderPosEmbed is the encoder positional embedding [H*W, batch, 256].
+	EncoderPosEmbed *Node
+	// Queries are the final decoder query features [batch, numQueries, 256].
+	Queries *Node
 }
 
 // Forward builds the full SAM 3.1 image-grounding graph.
@@ -88,10 +108,18 @@ func Forward(scope *model.Scope, pixelValues, tokenIDs, points, pointLabels, poi
 	predMasks := segmentationHead(scope.In("segmentation_head"), features, decOut.Queries, memory, prompt, promptMask, cfg)
 
 	return &ForwardOutput{
-		PredLogits:    decOut.PredLogits,
-		PredBoxes:     decOut.PredBoxes,
-		PredMasks:     predMasks,
-		PresenceLogit: decOut.PresenceLogitDec,
+		PredLogits:      decOut.PredLogits,
+		PredBoxes:       decOut.PredBoxes,
+		PredMasks:       predMasks,
+		PresenceLogit:   decOut.PresenceLogitDec,
+		FPNFeatures:     features,
+		FPNPosEnc:       posEnc,
+		TextMemory:      textMemory,
+		GeoFeats:        geoFeats,
+		Prompt:          prompt,
+		EncoderMemory:   memory,
+		EncoderPosEmbed: posEmbed,
+		Queries:         decOut.Queries,
 	}
 }
 

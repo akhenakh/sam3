@@ -18,6 +18,7 @@ require (
 	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gomlx/compute-onnx v0.0.0-20260730095030-43334863f719 // indirect
 	github.com/gomlx/go-xla v0.4.1 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
