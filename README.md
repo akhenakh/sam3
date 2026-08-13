@@ -63,8 +63,13 @@ best := detections[0] // best.Mask is a binary image.Image, best.Box is the bbox
 
 ## Demo CLI
 
+The demo segments a single image and writes **one** annotated image containing
+every detection, each drawn in a distinct color with its bounding box.
+
+![Example output](img/out.png)
+
 ```bash
-go build -o sam3-demo ./models/sam3/demo
+go build -o sam3-demo ./demo
 ./sam3-demo -input aerial.png -output out.png -bpe bpe_simple_vocab_16e6.txt.gz -text "buildings"
 ./sam3-demo -input aerial.png -output out.png -bpe bpe_simple_vocab_16e6.txt.gz -points "512,512,1"
 ./sam3-demo -input aerial.png -output out.png -bpe bpe_simple_vocab_16e6.txt.gz -boxes "100,100,800,800"
@@ -72,14 +77,14 @@ go build -o sam3-demo ./models/sam3/demo
 
 ### Flags
 * `-input`: input image path (PNG/JPEG).
-* `-output`: output image path.
+* `-output`: output image path (single file with all detections overlaid).
 * `-model`: HuggingFace repository ID (default `dummy9996/SAM3.1-safetensors-bf16-x-fp8`).
 * `-bpe`: path to `bpe_simple_vocab_16e6.txt.gz`.
 * `-text`: text prompt.
 * `-points`: `x,y,label;...` (label `1` foreground, `0` background).
 * `-boxes`: `xmin,ymin,xmax,ymax;...`.
 * `-threshold`: detection probability threshold (default `0.5`).
-* `-color` / `-format`: overlay color and output format.
+* `-format`: output image format (`png`/`jpg`, default inferred from `-output`).
 
 ## Notes
 
@@ -117,6 +122,9 @@ pip install torchvision==0.28.0+rocm7.2 --index-url https://download.pytorch.org
 ```
 
 The reference model runs in bfloat16 (its fused MLP casts to bf16) while this
-implementation runs in float32, so the backbone/encoder/decoder statistics
-agree to bf16 precision, and the final detection score heads (which amplify
-small query differences) are checked with a relaxed tolerance.
+implementation runs in float32. Structural quantities (backbone FPN, position
+encodings, text features, encoder memory, decoder queries, boxes) agree to
+bf16/fp32 precision; the detection-score heads (dot-product scoring, presence
+head, mask logits) amplify a small residual ViT-attention discrepancy
+(~1e-2 per block, still under investigation) into the final logits, so those
+are checked with a relaxed tolerance.

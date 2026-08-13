@@ -118,22 +118,15 @@ def main():
     data = {
         "text": args.text,
         "token_ids": [int(v) for v in tokenized[0].tolist()],
-        "pixel_values_shape": list(image.shape),
-        "pixel_values_mean": mean(image),
-        "pixel_values_std": float(image.float().std().item()),
         "backbone_fpn_means": [mean(x) for x in backbone_out["backbone_fpn"]],
-        "backbone_fpn_shapes": [list(x.shape) for x in backbone_out["backbone_fpn"]],
         "vision_pos_enc_means": [mean(x) for x in backbone_out["vision_pos_enc"]],
         "language_features_mean": mean(backbone_out["language_features"]),
         "encoder_hidden_states_mean": mean(outputs["encoder_hidden_states"]),
         "queries_mean": mean(outputs["queries"]),
         "pred_logits": [float(v) for v in outputs["pred_logits"][0, :, 0].cpu().tolist()],
         "pred_boxes_mean": mean(outputs["pred_boxes"]),
-        "pred_masks_shape": list(outputs["pred_masks"].shape),
         "pred_masks_mean": mean(outputs["pred_masks"]),
         "presence_logit": [float(v) for v in outputs["presence_logit_dec"][0].cpu().tolist()],
-        "queries_sample": [float(v) for v in outputs["queries"][0, :8, :16].reshape(-1).cpu().tolist()],
-        "pred_masks_sample": [float(v) for v in outputs["pred_masks"][0, 0, 0, :16].cpu().tolist()],
     }
 
     with open(args.out, "w") as f:

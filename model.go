@@ -12,7 +12,6 @@ import (
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/models/safetensors"
 	"github.com/gomlx/gomlx/core/graph"
-	"github.com/gomlx/gomlx/core/tensors"
 	"github.com/gomlx/gomlx/ml/model"
 	"github.com/pkg/errors"
 	"k8s.io/klog/v2"
@@ -47,23 +46,6 @@ func LoadModel(repo *hub.Repo) (*Model, error) {
 	}
 
 	return m, nil
-}
-
-// loadCastToFloat32 converts a tensor to float32 (used to unify the mixed
-// F32/BF16 checkpoint dtypes). The compiled graph is shared and reused across
-// all conversions.
-func loadCastToFloat32(backend compute.Backend, t *tensors.Tensor) (*tensors.Tensor, error) {
-	exec, err := graph.NewExec(backend, func(x *graph.Node) *graph.Node {
-		return graph.ConvertDType(x, dtypes.Float32)
-	})
-	if err != nil {
-		return nil, err
-	}
-	res, err := exec.Call(t)
-	if err != nil {
-		return nil, err
-	}
-	return res[0], nil
 }
 
 // mapTensorName translates a safetensors name (e.g.
@@ -102,6 +84,15 @@ func (m *Model) LoadStore(backend compute.Backend, store *model.Store) error {
 	var totalParams int64
 	var totalBytes int64
 
+	// A single cast-to-float32 executor, compiled once and reused for every
+	// BF16 weight (avoids recompiling the graph per tensor).
+	castExec, err := graph.NewExec(backend, func(x *graph.Node) *graph.Node {
+		return graph.ConvertDType(x, dtypes.Float32)
+	})
+	if err != nil {
+		return err
+	}
+
 	reader, err := safetensors.NewEmpty(m.Repo).NewTensorReader(WeightsFileName)
 	if err != nil {
 		return errors.Wrap(err, "failed to open safetensors checkpoint")
@@ -126,13 +117,13 @@ func (m *Model) LoadStore(backend compute.Backend, store *model.Store) error {
 		tensorToLoad := tensorAndName.Tensor
 		if tensorToLoad.DType() != dtypes.Float32 {
 			// Unify the mixed F32/BF16 checkpoint to float32.
-			converted, err := loadCastToFloat32(backend, tensorToLoad)
+			converted, err := castExec.Call(tensorToLoad)
 			if err != nil {
 				tensorToLoad.FinalizeAll()
 				return errors.WithMessagef(err, "failed to cast tensor %q to float32", tensorAndName.Name)
 			}
 			tensorToLoad.FinalizeAll()
-			tensorToLoad = converted
+			tensorToLoad = converted[0]
 		}
 
 		shape := tensorToLoad.Shape()
